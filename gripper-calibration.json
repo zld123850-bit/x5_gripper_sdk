@@ -1,0 +1,12 @@
+{
+  "calibrated_at": "2026-09-07T14:59:17.657+08:00",
+  "closed_position_rad": 4.745365072098878,
+  "device_serial": "X5-2023-001",
+  "feedback_can_id": null,
+  "interface": "can2",
+  "motor_can_id": 8,
+  "motor_profile": "dm_j4310",
+  "open_position_rad": -0.09517814908064359,
+  "robot_model": "X5-2023",
+  "schema_version": 1
+}
