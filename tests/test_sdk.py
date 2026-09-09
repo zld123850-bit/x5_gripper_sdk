@@ -307,6 +307,55 @@ class DriverTest(unittest.TestCase):
         self.assertLess(result.final_state.position_rad, result.target_position_rad)
         self.assertEqual(transport.sent[-1][1], DISABLE_COMMAND)
 
+    def test_relative_hold_to_move_keeps_sending_until_callback_stops(self) -> None:
+        clock = FakeClock()
+        transport = FakeTransport(clock, position=1.0)
+        gripper = X5Gripper(
+            config(), transport=transport, monotonic=clock.monotonic
+        ).connect()
+        callback_count = 0
+
+        def continue_motion() -> bool:
+            nonlocal callback_count
+            callback_count += 1
+            return callback_count <= 6
+
+        result = gripper.close_relative(
+            0.20,
+            torque_nm=0.25,
+            continue_motion=continue_motion,
+            duration_after_s=0.05,
+        )
+
+        commands = [
+            unpack_mit_command(payload)
+            for _, payload in transport.sent
+            if payload not in (ENABLE_COMMAND, DISABLE_COMMAND)
+        ]
+        self.assertTrue(result.stopped_by_request)
+        self.assertGreater(callback_count, 6)
+        self.assertTrue(any(command["torque"] > 0.24 for command in commands))
+        self.assertEqual(transport.sent[-1][1], DISABLE_COMMAND)
+
+    def test_relative_hold_to_move_reaches_cap_when_callback_stays_true(self) -> None:
+        clock = FakeClock()
+        transport = FakeTransport(clock, position=1.0)
+        gripper = X5Gripper(
+            config(), transport=transport, monotonic=clock.monotonic
+        ).connect()
+
+        result = gripper.open_relative(
+            0.10,
+            torque_nm=-0.10,
+            continue_motion=lambda: True,
+            duration_after_s=0.05,
+        )
+
+        self.assertFalse(result.stopped_by_request)
+        self.assertTrue(result.target_reached)
+        self.assertLessEqual(result.final_state.position_rad, result.target_position_rad + 0.02)
+        self.assertEqual(transport.sent[-1][1], DISABLE_COMMAND)
+
     def test_velocity_fault_disables(self) -> None:
         clock = FakeClock()
         transport = FakeTransport(clock, velocity=2.1)

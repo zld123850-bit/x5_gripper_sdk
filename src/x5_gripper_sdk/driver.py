@@ -253,10 +253,12 @@ class X5Gripper:
         speed_rad_s: float = 0.15,
         duration_after_s: float = 0.2,
         torque_nm: float | None = None,
+        continue_motion: Callable[[], bool] | None = None,
     ) -> MotionResult:
         """微动接口：向已验证的正编码器方向相对闭合。
 
         默认使用限速位置斜坡。传入正 torque_nm 时使用 kp=0 的力矩微动。
+        ``continue_motion`` 返回 False 时立即停止并失能，用于按住按键连续运动。
         """
         distance = self._validate_distance(distance_rad, self.config.max_close_nudge_rad, "闭合")
         self._validate_duration(duration_after_s)
@@ -278,6 +280,7 @@ class X5Gripper:
             ff_torque_nm=torque,
             kp=kp,
             duration_after_s=duration_after_s,
+            continue_motion=continue_motion,
         )
 
     def open_relative(
@@ -286,6 +289,7 @@ class X5Gripper:
         *,
         torque_nm: float = -0.10,
         duration_after_s: float = 0.2,
+        continue_motion: Callable[[], bool] | None = None,
     ) -> MotionResult:
         """微动接口：用 kp=0 和负前馈力矩向负编码器方向相对张开。"""
         distance = self._validate_distance(distance_rad, self.config.max_open_nudge_rad, "张开")
@@ -300,6 +304,7 @@ class X5Gripper:
             ff_torque_nm=torque,
             kp=0.0,
             duration_after_s=duration_after_s,
+            continue_motion=continue_motion,
         )
 
     def _run_motion(
@@ -351,6 +356,8 @@ class X5Gripper:
                 torque_mode = kp == 0.0 and abs(ff_torque_nm) > 0.0
                 slew_s = 0.0 if torque_mode or delta == 0.0 else abs(delta) / speed_rad_s
                 total_s = slew_s + duration_after_s
+                hold_to_move = continue_motion is not None and torque_mode
+                hold_timeout_s = max(2.0, abs(delta) / 0.02) if hold_to_move else total_s
                 period = 1.0 / self.config.refresh_hz
                 command_position = start
                 command_torque = ff_torque_nm if torque_mode else 0.0
@@ -368,6 +375,7 @@ class X5Gripper:
                 last_feedback_at = started
                 latest = before
                 torque_reached = False
+                torque_reached_at: float | None = None
                 max_velocity = 0.0
                 max_excursion = 0.0
                 max_tracking = 0.0
@@ -388,6 +396,7 @@ class X5Gripper:
                             or (delta > 0.0 and measured_now >= target)
                         ):
                             torque_reached = True
+                            torque_reached_at = now
                         command_position = start
                         command_torque = 0.0 if torque_reached else ff_torque_nm
                     else:
@@ -448,7 +457,16 @@ class X5Gripper:
                         raise GripperSafetyError("保持期间夹爪偏离初始位置。")
                     if delta != 0.0 and not torque_mode and tracking > self.config.max_tracking_error_rad:
                         raise GripperSafetyError("位置跟踪误差超过安全限制。")
-                    if received_at - started >= total_s:
+                    if hold_to_move:
+                        if (
+                            torque_reached
+                            and torque_reached_at is not None
+                            and now - torque_reached_at >= duration_after_s
+                        ):
+                            break
+                        if not torque_reached and elapsed >= hold_timeout_s:
+                            raise GripperSafetyError("连续微动超时，已失能。")
+                    elif received_at - started >= total_s:
                         break
 
                 final_state = self._to_state(latest)

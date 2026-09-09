@@ -1,7 +1,7 @@
 """直接调用 x5_gripper_sdk 的持续按键与双端点标定实机测试。
 
-按住 C/O 可连续发送小步动作；每步结束会丢弃动作期间积压的
-键盘自动重复字符，避免松开按键后仍继续运动。
+按住 C/O 期间持续发送运动命令；松开后停止并失能。普通终端没有真实
+KeyUp，因此用键盘自动重复推断按键是否仍按住。
 """
 
 from __future__ import annotations
@@ -11,7 +11,6 @@ import os
 import select
 import sys
 import termios
-import time
 import tty
 from contextlib import contextmanager
 from datetime import datetime
@@ -33,6 +32,7 @@ from x5_gripper_sdk import (
     X5Gripper,
     save_calibration,
 )
+from x5_gripper_sdk.held_key import HeldKeyTracker
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -54,7 +54,12 @@ def build_parser() -> argparse.ArgumentParser:
         type=Path,
         default=Path("./gripper_X5-2023-001.json"),
     )
-    parser.add_argument("--step-rad", type=float, default=0.02)
+    parser.add_argument(
+        "--step-rad",
+        type=float,
+        default=0.50,
+        help="按住一次连续运动的行程上限；闭合仍受 SDK 0.20 rad 限制",
+    )
     parser.add_argument("--close-torque-nm", type=float, default=0.25)
     parser.add_argument("--open-torque-nm", type=float, default=-0.25)
     parser.add_argument("--hold-seconds", type=float, default=1.0)
@@ -120,6 +125,8 @@ def print_motion(result: MotionResult) -> None:
         f"反馈力矩={result.final_state.torque_nm:.4f} Nm，"
         f"到达目标={result.target_reached}"
     )
+    if result.stopped_by_request:
+        print("松开按键，连续运动已停止并失能。")
 
 
 def capture_closed(gripper: X5Gripper) -> GripperState:
@@ -164,16 +171,65 @@ def capture_open_and_save(
 def print_help() -> None:
     print(
         "\r\n按键无需 Enter：\r\n"
-        "  按住 c  连续小步闭合（+0.25 Nm）\r\n"
-        "  按住 o  连续小步张开（-0.25 Nm）\r\n"
+        "  按住 c  连续闭合（+0.25 Nm），松手停止\r\n"
+        "  按住 o  连续张开（-0.25 Nm），松手停止\r\n"
         "  空格    立即 DISABLE\r\n"
         "  h       保持当前位置\r\n"
         "  z       采集完全闭合端\r\n"
         "  m       采集最大张开端、保存并加载标定\r\n"
         "  ?       重新显示帮助\r\n"
         "  q/Esc   DISABLE 并退出\r\n"
-        "标定顺序：小步移动到闭合端 → 松键并按 z → 小步移动到张开端 → 松键并按 m。"
+        "标定顺序：按住移动到闭合端 → 松键并按 z → 按住移动到张开端 → 松键并按 m。"
     )
+
+
+def _run_held_relative(
+    gripper: X5Gripper,
+    args: argparse.Namespace,
+    *,
+    descriptor: int,
+    key: str,
+    blocked_direction: str | None,
+) -> tuple[str | None, str | None]:
+    """按住期间连续发送相对运动命令；返回 (pending_key, blocked_direction)。"""
+    if blocked_direction == key:
+        label = "闭合" if key == "c" else "张开"
+        print(f"\r\n{label}已锁定；先检查端点/阻挡，按反向键解除。")
+        return None, blocked_direction
+
+    tracker = HeldKeyTracker(descriptor, key)
+    if key == "c":
+        distance = min(args.step_rad, gripper.config.max_close_nudge_rad)
+        move = lambda: gripper.close_relative(
+            distance,
+            torque_nm=args.close_torque_nm,
+            continue_motion=tracker.continue_motion,
+            duration_after_s=0.05,
+        )
+        label = "闭合"
+    else:
+        distance = min(args.step_rad, gripper.config.max_open_nudge_rad)
+        move = lambda: gripper.open_relative(
+            distance,
+            torque_nm=args.open_torque_nm,
+            continue_motion=tracker.continue_motion,
+            duration_after_s=0.05,
+        )
+        label = "张开"
+
+    blocked = None
+
+    while True:
+        result = move()
+        print_motion(result)
+        if result.stopped_by_request:
+            return tracker.pending_key, blocked
+        if not result.target_reached:
+            print(f"{label}未到目标；已锁定 {key}。先检查端点/阻挡，按反向键解除。")
+            tracker.wait_for_release_after_endpoint()
+            return tracker.pending_key, key
+        if not tracker.continue_motion():
+            return tracker.pending_key, blocked
 
 
 def run(gripper: X5Gripper, args: argparse.Namespace) -> None:
@@ -181,8 +237,12 @@ def run(gripper: X5Gripper, args: argparse.Namespace) -> None:
     blocked_direction: str | None = None
     print_help()
     with immediate_keys() as descriptor:
+        pending_key: str | None = None
         while True:
-            key = read_key(descriptor)
+            key = pending_key
+            pending_key = None
+            if key is None:
+                key = read_key(descriptor)
             if key is None:
                 continue
             key = key.lower()
@@ -200,28 +260,14 @@ def run(gripper: X5Gripper, args: argparse.Namespace) -> None:
                 if key == "h":
                     result = gripper.hold(args.hold_seconds)
                     print_motion(result)
-                elif key == "c":
-                    if blocked_direction == "c":
-                        continue
-                    result = gripper.close_relative(
-                        args.step_rad,
-                        torque_nm=args.close_torque_nm,
+                elif key in {"c", "o"}:
+                    pending_key, blocked_direction = _run_held_relative(
+                        gripper,
+                        args,
+                        descriptor=descriptor,
+                        key=key,
+                        blocked_direction=blocked_direction,
                     )
-                    print_motion(result)
-                    blocked_direction = None if result.target_reached else "c"
-                    if blocked_direction:
-                        print("闭合未到目标；已锁定 c。先检查端点/阻挡，按 o 可解除。")
-                elif key == "o":
-                    if blocked_direction == "o":
-                        continue
-                    result = gripper.open_relative(
-                        args.step_rad,
-                        torque_nm=args.open_torque_nm,
-                    )
-                    print_motion(result)
-                    blocked_direction = None if result.target_reached else "o"
-                    if blocked_direction:
-                        print("张开未到目标；已锁定 o。先检查端点/阻挡，按 c 可解除。")
                 elif key == "z":
                     closed_state = capture_closed(gripper)
                     blocked_direction = "c"
@@ -239,11 +285,8 @@ def run(gripper: X5Gripper, args: argparse.Namespace) -> None:
                 gripper.emergency_stop()
                 print(f"\r\n动作被拒绝并已失能：{exc}")
             finally:
-                drain_queued_keys(descriptor)
-            if key == "c":
-                blocked_direction = None if blocked_direction == "o" else blocked_direction
-            elif key == "o":
-                blocked_direction = None if blocked_direction == "c" else blocked_direction
+                if key not in {"c", "o"}:
+                    drain_queued_keys(descriptor)
 
 
 def main() -> None:
@@ -267,7 +310,11 @@ def main() -> None:
 
     print("警告：本脚本会直接调用 SDK 驱动真实夹爪。")
     print("请固定机械臂、清空夹爪、停止其他 can 写入程序并准备好急停。")
-    print(f"单步={args.step_rad:.3f} rad，闭合={args.close_torque_nm:+.2f} Nm，张开={args.open_torque_nm:+.2f} Nm")
+    print(
+        f"按住时连续运动，单段上限={args.step_rad:.3f} rad"
+        f"（闭合≤{config.max_close_nudge_rad:.2f}，张开≤{config.max_open_nudge_rad:.2f}），"
+        f"闭合={args.close_torque_nm:+.2f} Nm，张开={args.open_torque_nm:+.2f} Nm"
+    )
     print(f"标定文件：{calibration_path}（{'已加载' if existing_calibration else '尚不存在'}）")
     if input("确认以上条件后输入大写 RUN：").strip() != "RUN":
         raise SystemExit("未确认，测试取消。")
